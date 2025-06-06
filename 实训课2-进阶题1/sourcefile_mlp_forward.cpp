@@ -15,10 +15,11 @@ do { \
     } \
 } while(0)
 
-#define BATCH 1024
-#define I 10
-#define H 20
-#define O 5
+#define BATCH 2048
+#define I 1024
+#define H 512
+#define O 128
+#define BLOCK_SIZE 32  // 块大小，可以根据DCU特性调整
 
 // 主要修改函数
 __global__ void matmul_kernel(const double* A, const double* B, double* C, int M, int N, int K) {

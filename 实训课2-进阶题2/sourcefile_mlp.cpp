@@ -8,6 +8,7 @@
 #include <sstream>
 #include <algorithm>
 #include <random>
+#include <iomanip> // 新增: 用于格式化输出
 
 // 编译文件
 // hipcc sourcefile_mlp.cpp -o mlp_full_dcu
@@ -307,6 +308,33 @@ void save_model(const std::vector<double>& w1, const std::vector<double>& b1,
     std::cout << "Model saved to " << filename << std::endl;
 }
 
+// 保存预测结果到CSV文件
+void save_predictions_to_csv(const std::vector<double>& actuals_norm,
+                             const std::vector<double>& predictions_norm,
+                             const std::vector<double>& actuals_real,
+                             const std::vector<double>& predictions_real,
+                             const std::string& filename) {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error: Cannot open file " << filename << " for writing predictions." << std::endl;
+        return;
+    }
+
+    // 写入表头
+    file << "Actual_Normalized,Predicted_Normalized,Actual_Real,Predicted_Real\n";
+
+    // 写入数据
+    for (size_t i = 0; i < actuals_norm.size(); ++i) {
+        file << actuals_norm[i] << ","
+             << predictions_norm[i] << ","
+             << actuals_real[i] << ","
+             << predictions_real[i] << "\n";
+    }
+
+    file.close();
+    std::cout << "Predictions saved to " << filename << std::endl;
+}
+
 // ----------------------------- Main -------------------------------
 int main() {
     // 设置随机种子
@@ -379,6 +407,9 @@ int main() {
     hipMemcpy(d_b2, b2.data(), b2.size() * sizeof(double), hipMemcpyHostToDevice);
     
     // 训练MLP网络
+    double total_training_time_ms = 0.0; // 新增: 总训练时间
+    std::cout << std::fixed << std::setprecision(6); // 设置输出精度
+
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
         auto start_time = std::chrono::high_resolution_clock::now();
         double total_loss = 0.0;
@@ -501,10 +532,19 @@ int main() {
         
         auto end_time = std::chrono::high_resolution_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        total_training_time_ms += ms; // 累积训练时间
         
         total_loss /= num_batches;
         std::cout << "[Epoch " << epoch + 1 << "] Loss: " << total_loss << ", Time: " << ms << " ms" << std::endl;
     }
+
+    std::cout << "\n=== Training Performance Summary ===" << std::endl;
+    std::cout << "Total Training Time: " << total_training_time_ms / 1000.0 << " seconds" << std::endl;
+    if (total_training_time_ms > 0) {
+        double training_throughput = static_cast<double>(train_size * EPOCHS) / (total_training_time_ms / 1000.0);
+        std::cout << "Training Throughput: " << training_throughput << " samples/sec" << std::endl;
+    }
+
 
     // 推理部分，测试训练的MLP网络
     std::cout << "\n=== Testing Phase ===" << std::endl;
@@ -514,9 +554,11 @@ int main() {
     double mae = 0.0;  // 平均绝对误差
     
     // 测试所有测试样本以获得完整评估
-    int test_samples = test_size;  // 测试全部测试集
+    int test_samples_count = test_size;  // 重命名以避免与函数参数混淆
     
-    for (int i = train_size; i < train_size + test_samples; ++i) {
+    auto inference_start_time = std::chrono::high_resolution_clock::now(); // 新增: 推理开始时间
+
+    for (int i = train_size; i < train_size + test_samples_count; ++i) {
         std::vector<double> test_x(INPUT_DIM);
         for (int j = 0; j < INPUT_DIM; ++j) {
             test_x[j] = X[i * INPUT_DIM + j];
@@ -554,14 +596,17 @@ int main() {
         
         // 只显示前10个样本的详细结果，避免输出过多
         if (i < train_size + 10) {
-            std::cout << "Sample " << (i - train_size + 1) << " - Predicted: " << prediction 
-                      << ", Actual: " << actual << ", Error: " << diff << std::endl;
+            std::cout << "Sample " << (i - train_size + 1) << " - Normalized Predicted: " << prediction 
+                      << ", Normalized Actual: " << actual << ", Error: " << diff << std::endl;
         }
     }
     
+    auto inference_end_time = std::chrono::high_resolution_clock::now(); // 新增: 推理结束时间
+    double total_inference_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(inference_end_time - inference_start_time).count();
+
     // 计算评估指标
-    test_loss /= test_samples;  // MSE
-    mae /= test_samples;        // MAE
+    test_loss /= test_samples_count;  // MSE
+    mae /= test_samples_count;        // MAE
     
     // 计算决定系数 R²
     double mean_actual = 0.0;
@@ -576,11 +621,20 @@ int main() {
     double r2 = 1.0 - (ss_res / ss_tot);
     
     std::cout << "\n=== Test Results Summary ===" << std::endl;
-    std::cout << "Total test samples: " << test_samples << " (100% of test set)" << std::endl;
+    std::cout << "Total test samples: " << test_samples_count << " (100% of test set)" << std::endl;
     std::cout << "Mean Squared Error (MSE): " << test_loss << std::endl;
     std::cout << "Root Mean Squared Error (RMSE): " << std::sqrt(test_loss) << std::endl;
     std::cout << "Mean Absolute Error (MAE): " << mae << std::endl;
     std::cout << "R² Score: " << r2 << std::endl;
+
+    std::cout << "\n=== Inference Performance Summary ===" << std::endl;
+    std::cout << "Total Inference Time: " << total_inference_time_ms / 1000.0 << " seconds for " << test_samples_count << " samples" << std::endl;
+    if (test_samples_count > 0 && total_inference_time_ms > 0) {
+        double avg_inference_latency_ms = total_inference_time_ms / test_samples_count;
+        std::cout << "Average Inference Latency: " << avg_inference_latency_ms << " ms/sample" << std::endl;
+        double inference_throughput = static_cast<double>(test_samples_count) / (total_inference_time_ms / 1000.0);
+        std::cout << "Inference Throughput: " << inference_throughput << " samples/sec" << std::endl;
+    }
     
     // 反归一化显示真实值（如果需要）
     std::vector<double> real_predictions = predictions;
@@ -588,7 +642,7 @@ int main() {
     denormalize_data(real_predictions, min_val, max_val);
     denormalize_data(real_actuals, min_val, max_val);
     
-    std::cout << "\n=== Real Values (Denormalized) Sample ===" << std::endl;
+    std::cout << "\n=== Real Values (Denormalized) Sample (First 10) ===" << std::endl;
     for (int i = 0; i < std::min(10, (int)real_predictions.size()); ++i) {
         std::cout << "Real Predicted: " << real_predictions[i] 
                   << ", Real Actual: " << real_actuals[i] 
@@ -603,6 +657,9 @@ int main() {
     
     save_model(w1, b1, w2, b2, "mlp_model.txt");
     
+    // 新增: 保存预测结果到CSV文件
+    save_predictions_to_csv(actuals, predictions, real_actuals, real_predictions, "predictions_vs_actuals.csv");
+
     // 清理GPU内存
     hipFree(d_X); hipFree(d_y); hipFree(d_w1); hipFree(d_b1);
     hipFree(d_w2); hipFree(d_b2); hipFree(d_hidden); hipFree(d_output);

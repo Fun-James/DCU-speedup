@@ -74,25 +74,41 @@ void matmul_block_tiling(const std::vector<double>& A,
     // 初始化结果矩阵
     std::fill(C.begin(), C.end(), 0.0);
     
-    // 子块并行化矩阵乘法
-    #pragma omp parallel for
+    // 优化的子块并行化矩阵乘法
+    // 使用collapse(2)并行化前两层循环，获得更好的负载均衡
+    #pragma omp parallel for collapse(2) schedule(dynamic)
     for (int ii = 0; ii < N; ii += block_size) {
         for (int jj = 0; jj < P; jj += block_size) {
+            // 计算当前块的边界
+            int i_end = std::min(ii + block_size, N);
+            int j_end = std::min(jj + block_size, P);
+            
+            // 为每个(ii,jj)块分配局部缓冲区，避免写冲突
+            std::vector<double> local_C((i_end - ii) * (j_end - jj), 0.0);
+            
+            // K维度的分块循环
             for (int kk = 0; kk < M; kk += block_size) {
-                // 计算子块的边界
-                int i_end = std::min(ii + block_size, N);
-                int j_end = std::min(jj + block_size, P);
                 int k_end = std::min(kk + block_size, M);
                 
-                // 在子块内执行矩阵乘法
+                // 优化的内层循环：改善内存访问模式
                 for (int i = ii; i < i_end; ++i) {
-                    for (int j = jj; j < j_end; ++j) {
-                        double sum = 0.0;
-                        for (int k = kk; k < k_end; ++k) {
-                            sum += A[i * M + k] * B[k * P + j];
+                    int local_i = i - ii;
+                    for (int k = kk; k < k_end; ++k) {
+                        double a_ik = A[i * M + k];  // 缓存A元素
+                        for (int j = jj; j < j_end; ++j) {
+                            int local_j = j - jj;
+                            local_C[local_i * (j_end - jj) + local_j] += a_ik * B[k * P + j];
                         }
-                        C[i * P + j] += sum;
                     }
+                }
+            }
+            
+            // 将局部结果写回全局矩阵
+            for (int i = ii; i < i_end; ++i) {
+                int local_i = i - ii;
+                for (int j = jj; j < j_end; ++j) {
+                    int local_j = j - jj;
+                    C[i * P + j] += local_C[local_i * (j_end - jj) + local_j];
                 }
             }
         }
@@ -202,6 +218,11 @@ void matmul_other(const std::vector<double>& A,
     int rank, mpi_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+    
+    if (rank == 0) {
+        std::cout << "Using " << mpi_size << " MPI processes with OpenMP threads" << std::endl;
+        std::cout << "Matrix sizes: A(" << N << "x" << M << ") * B(" << M << "x" << P << ") = C(" << N << "x" << P << ")" << std::endl;
+    }
 
     // --- MPI Data Distribution ---
     int rows_per_proc = N / mpi_size;
@@ -246,10 +267,18 @@ void matmul_other(const std::vector<double>& A,
     }
     MPI_Bcast(B_broadcast.data(), M * P, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
+    // 开始计时本地计算
+    auto local_start = std::chrono::high_resolution_clock::now();
+
     // --- Local Computation (OpenMP Sub-block Tiling) ---
     // Each MPI process computes its part of C (local_C) using local_A and B_broadcast.
     // The OpenMP parallelism is within this block.
-    int block_size = 64; // Define your desired block size
+    
+    // 自适应分块大小：根据数据规模和线程数调整
+    int num_threads = omp_get_max_threads();
+    int adaptive_block_size = std::min(64, std::max(16, (int)sqrt(local_N * P / num_threads)));
+    int block_size = adaptive_block_size;
+    
     std::fill(local_C.begin(), local_C.end(), 0.0); // Initialize local_C for accumulation
 
     // Parallelize the outer two loops for better load distribution
@@ -264,17 +293,23 @@ void matmul_other(const std::vector<double>& A,
                 int k_end = std::min(kk + block_size, M);
 
                 for (int i = ii; i < i_end; ++i) {        // Current row in local_A / local_C
-                    for (int j = jj; j < j_end; ++j) {    // Current column in B_broadcast / local_C
-                        double sum_for_k_block = 0.0;
-                        for (int k = kk; k < k_end; ++k) { // Innermost loop for dot product part
-                            sum_for_k_block += local_A[i * M + k] * B_broadcast[k * P + j];
+                    for (int k = kk; k < k_end; ++k) { // 重排循环提高内存局部性
+                        double a_ik = local_A[i * M + k];  // 缓存A元素
+                        for (int j = jj; j < j_end; ++j) {    // Current column in B_broadcast / local_C
+                            local_C[i * P + j] += a_ik * B_broadcast[k * P + j];
                         }
-                        local_C[i * P + j] += sum_for_k_block; // Accumulate result
                     }
                 }
             }
         }
     }
+
+    auto local_end = std::chrono::high_resolution_clock::now();
+    auto local_duration = std::chrono::duration_cast<std::chrono::milliseconds>(local_end - local_start);
+    
+    // 输出每个进程的计算时间
+    printf("Process %d: Local computation time: %ld ms (handling %d rows)\n", 
+           rank, local_duration.count(), local_N);
 
     // --- MPI Data Aggregation ---
     // Gather local_C from all processes to C on rank 0
